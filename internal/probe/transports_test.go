@@ -66,7 +66,7 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 				return
 			}
 			if cfg.genericSSE {
-				fmt.Fprint(w, "data: unrelated stream\n\n")
+				reply(w, "server/discover", discovery(), true)
 				return
 			}
 			endpoint := "/messages"
@@ -144,7 +144,7 @@ func TestSupportedTransports(t *testing.T) {
 		{"both", transportFixture{http: true, sse: true}, []string{StreamableHTTP, HTTPSSE}},
 		{"both with sessions", transportFixture{http: true, sse: true, initializeHTTP: true}, []string{StreamableHTTP, HTTPSSE}},
 		{"failed SSE initialization", transportFixture{http: true, sse: true, badSSE: true}, []string{StreamableHTTP}},
-		{"generic SSE", transportFixture{http: true, genericSSE: true}, []string{StreamableHTTP}},
+		{"modern SSE without legacy endpoint", transportFixture{http: true, streamedHTTP: true, genericSSE: true}, []string{StreamableHTTP}},
 		{"cross-origin POST", transportFixture{http: true, sse: true, crossOrigin: true}, []string{StreamableHTTP}},
 		{"stalled HTTP", transportFixture{stallHTTP: true, sse: true}, []string{HTTPSSE}},
 		{"stalled SSE", transportFixture{http: true, stallSSE: true}, []string{StreamableHTTP}},
@@ -264,5 +264,22 @@ func TestLegacyPostRedirectStaysOnOrigin(t *testing.T) {
 	findings, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL + "/mcp"})
 	if err == nil || len(findings) != 0 || outsideCalls.Load() != 0 {
 		t.Fatalf("legacy POST left its origin: %+v, %v, calls=%d", findings, err, outsideCalls.Load())
+	}
+}
+
+func TestMergeRetainsOptionalServerInfo(t *testing.T) {
+	info := &ServerInfo{Name: "known-server", Version: "1"}
+	for _, reverse := range []bool{false, true} {
+		initialized := newFinding("https://example.com/mcp", StreamableHTTP, "initialize", []string{"2025-11-25"}, info)
+		discovered := newFinding(initialized.URL, StreamableHTTP, "server/discover", []string{modernVersion}, nil)
+		f, other := initialized, discovered
+		if reverse {
+			f, other = discovered, initialized
+		}
+		f.Merge(*other)
+		if f.Method != "server/discover" || f.ServerInfo == nil || *f.ServerInfo != *info || f.TransportDetails[StreamableHTTP].ServerInfo != f.ServerInfo ||
+			!reflect.DeepEqual(f.ProtocolVersions, []string{modernVersion, "2025-11-25"}) {
+			t.Fatalf("optional discovery metadata erased earlier evidence: %+v", f)
+		}
 	}
 }

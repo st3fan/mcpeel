@@ -50,6 +50,9 @@ func (f *Finding) Merge(other Finding) {
 		}
 		slices.Sort(versions)
 		slices.Reverse(versions)
+		if incoming.ServerInfo == nil {
+			incoming.ServerInfo = detail.ServerInfo
+		}
 		if !exists || incoming.Method == "server/discover" && detail.Method != "server/discover" {
 			detail = incoming
 		}
