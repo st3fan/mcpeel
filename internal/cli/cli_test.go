@@ -161,9 +161,9 @@ func TestCommandFailures(t *testing.T) {
 	}
 }
 
-type checkFunc func(context.Context, targets.Candidate) (*probe.Finding, error)
+type checkFunc func(context.Context, targets.Candidate) ([]probe.Finding, error)
 
-func (f checkFunc) Probe(ctx context.Context, c targets.Candidate) (*probe.Finding, error) {
+func (f checkFunc) Probe(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
 	return f(ctx, c)
 }
 
@@ -179,7 +179,7 @@ func TestWorkerBoundAndFindingDedup(t *testing.T) {
 	var active, peak, count atomic.Int32
 	release := make(chan struct{})
 	var once sync.Once
-	p := checkFunc(func(ctx context.Context, c targets.Candidate) (*probe.Finding, error) {
+	p := checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
 		n := active.Add(1)
 		defer active.Add(-1)
 		for old := peak.Load(); n > old; old = peak.Load() {
@@ -196,7 +196,7 @@ func TestWorkerBoundAndFindingDedup(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		count.Add(1)
-		return &probe.Finding{URL: "https://found.invalid/mcp"}, nil
+		return []probe.Finding{{URL: "https://found.invalid/mcp"}}, nil
 	})
 	var out bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -213,7 +213,7 @@ func TestScanCancellationAndOutputFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	var once sync.Once
-	p := checkFunc(func(ctx context.Context, c targets.Candidate) (*probe.Finding, error) {
+	p := checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -230,8 +230,8 @@ func TestScanCancellationAndOutputFailure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("workers failed to stop on cancellation")
 	}
-	p = checkFunc(func(ctx context.Context, c targets.Candidate) (*probe.Finding, error) {
-		return &probe.Finding{URL: c.URL}, nil
+	p = checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
+		return []probe.Finding{{URL: c.URL}}, nil
 	})
 	if err := scan(context.Background(), config{concurrency: 2}, testCandidates(100), p, brokenWriter{}, io.Discard); err == nil || !strings.Contains(err.Error(), "write failed") {
 		t.Fatalf("output failure: %v", err)
@@ -252,6 +252,10 @@ func TestCommandTimeoutContinuesToOtherEndpoints(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/slow":
+			if r.Method == http.MethodGet {
+				w.WriteHeader(405)
+				return
+			}
 			var req struct{ Method string }
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Errorf("decode request: %v", err)

@@ -26,6 +26,17 @@ type rpcRequest struct {
 	} `json:"params"`
 }
 
+func probeOne(p *Prober, ctx context.Context, c targets.Candidate) (*Finding, error) {
+	findings, err := p.Probe(ctx, c)
+	if len(findings) == 0 {
+		return nil, err
+	}
+	if len(findings) != 1 {
+		return nil, fmt.Errorf("expected one endpoint, got %d", len(findings))
+	}
+	return &findings[0], err
+}
+
 func request(t *testing.T, r *http.Request) rpcRequest {
 	t.Helper()
 	var req rpcRequest
@@ -59,6 +70,10 @@ func TestModernDiscovery(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(405)
+					return
+				}
 				req := request(t, r)
 				if req.Method != "server/discover" || req.Params.Meta.Version != modernVersion || r.Header.Get("Mcp-Method") != req.Method || r.Header.Get("MCP-Protocol-Version") != modernVersion ||
 					!strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
@@ -69,7 +84,7 @@ func TestModernDiscovery(t *testing.T) {
 			defer s.Close()
 			p := New(time.Second)
 			defer p.Close()
-			f, err := p.Probe(context.Background(), targets.Candidate{Input: "original", URL: s.URL + "/mcp"})
+			f, err := probeOne(p, context.Background(), targets.Candidate{Input: "original", URL: s.URL + "/mcp"})
 			if err != nil || f == nil || f.URL != s.URL+"/mcp" || f.Method != "server/discover" || f.Input != "original" || f.ServerInfo.Name != "fixture" {
 				t.Fatalf("finding = %+v, %v", f, err)
 			}
@@ -92,6 +107,10 @@ func TestInitializeAndCleanup(t *testing.T) {
 			var notified, deleted atomic.Bool
 			var attempts atomic.Int32
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(405)
+					return
+				}
 				if r.Method == "DELETE" {
 					deleted.Store(r.Header.Get("Mcp-Session-Id") == "session-1" && r.Header.Get("MCP-Protocol-Version") == version)
 					w.WriteHeader(204)
@@ -120,7 +139,7 @@ func TestInitializeAndCleanup(t *testing.T) {
 			defer s.Close()
 			p := New(time.Second)
 			defer p.Close()
-			f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL})
+			f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL})
 			if err != nil || f == nil || f.ProtocolVersions[0] != version || !notified.Load() || !deleted.Load() {
 				t.Fatalf("finding=%+v error=%v notified=%v deleted=%v", f, err, notified.Load(), deleted.Load())
 			}
@@ -143,6 +162,10 @@ func TestInvalidInitializeResult(t *testing.T) {
 		map[string]any{"protocolVersion": legacyVersions[0], "capabilities": map[string]any{}, "serverInfo": ServerInfo{Name: "missing version"}},
 	} {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(405)
+				return
+			}
 			req := request(t, r)
 			if req.Method == "server/discover" {
 				w.WriteHeader(400)
@@ -151,7 +174,7 @@ func TestInvalidInitializeResult(t *testing.T) {
 			reply(w, req.ID, result, false)
 		}))
 		p := New(time.Second)
-		f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL})
+		f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL})
 		p.Close()
 		s.Close()
 		if f != nil || err == nil {
@@ -197,7 +220,7 @@ func TestLegacySSE(t *testing.T) {
 			defer s.Close()
 			p := New(time.Second)
 			defer p.Close()
-			f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL + "/sse"})
+			f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL + "/sse"})
 			if strings.HasPrefix(endpoint, "https:") {
 				if err == nil || f != nil {
 					t.Fatalf("accepted cross-origin endpoint: %+v, %v", f, err)
@@ -243,7 +266,7 @@ func TestUnconfirmedResponses(t *testing.T) {
 			defer s.Close()
 			p := New(time.Second)
 			defer p.Close()
-			if f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil {
+			if f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil {
 				t.Fatalf("false confirmation: %+v, %v", f, err)
 			}
 		})
@@ -253,6 +276,10 @@ func TestUnconfirmedResponses(t *testing.T) {
 func TestModernErrorDoesNotFallBack(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(405)
+			return
+		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
@@ -261,13 +288,17 @@ func TestModernErrorDoesNotFallBack(t *testing.T) {
 	defer s.Close()
 	p := New(time.Second)
 	defer p.Close()
-	if f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL}); f != nil || err == nil || calls.Load() != 1 {
+	if f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL}); f != nil || err == nil || calls.Load() != 1 {
 		t.Fatalf("modern error fallback: %+v, %v, calls=%d", f, err, calls.Load())
 	}
 }
 
 func TestFallback(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(405)
+			return
+		}
 		req := request(t, r)
 		reply(w, req.ID, discovery(), false)
 	}))
@@ -275,10 +306,10 @@ func TestFallback(t *testing.T) {
 	p := New(time.Second)
 	defer p.Close()
 	secureURL := strings.Replace(s.URL, "http:", "https:", 1)
-	if f, err := p.Probe(context.Background(), targets.Candidate{URL: secureURL, Fallback: true}); err != nil || f == nil || f.URL != s.URL {
+	if f, err := probeOne(p, context.Background(), targets.Candidate{URL: secureURL, Fallback: true}); err != nil || f == nil || f.URL != s.URL {
 		t.Fatalf("schemeless fallback: %+v, %v", f, err)
 	}
-	if f, err := p.Probe(context.Background(), targets.Candidate{URL: secureURL}); err == nil || f != nil {
+	if f, err := probeOne(p, context.Background(), targets.Candidate{URL: secureURL}); err == nil || f != nil {
 		t.Fatalf("explicit HTTPS used fallback: %+v, %v", f, err)
 	}
 	var tlsCalls atomic.Int32
@@ -288,7 +319,7 @@ func TestFallback(t *testing.T) {
 	}))
 	defer tlsServer.Close()
 	p.client.Transport = tlsServer.Client().Transport
-	if f, err := p.Probe(context.Background(), targets.Candidate{URL: tlsServer.URL, Fallback: true}); err == nil || f != nil || tlsCalls.Load() != 3 {
+	if f, err := probeOne(p, context.Background(), targets.Candidate{URL: tlsServer.URL, Fallback: true}); err == nil || f != nil || tlsCalls.Load() != 3 {
 		t.Fatalf("HTTP response caused fallback: %+v, %v, calls=%d", f, err, tlsCalls.Load())
 	}
 }
@@ -297,6 +328,10 @@ func TestRedirects(t *testing.T) {
 	for _, status := range []int{301, 302, 303, 307, 308} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(405)
+					return
+				}
 				if r.URL.Path == "/" {
 					w.Header().Set("Location", "/mcp")
 					w.WriteHeader(status)
@@ -311,7 +346,7 @@ func TestRedirects(t *testing.T) {
 			defer s.Close()
 			p := New(time.Second)
 			defer p.Close()
-			f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL})
+			f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL})
 			if status == 307 || status == 308 {
 				if err != nil || f == nil || f.URL != s.URL+"/mcp" {
 					t.Fatalf("redirected finding = %+v, %v", f, err)
@@ -325,7 +360,9 @@ func TestRedirects(t *testing.T) {
 		t.Run(location, func(t *testing.T) {
 			var calls atomic.Int32
 			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
+				if r.Method == http.MethodPost {
+					calls.Add(1)
+				}
 				w.Header().Set("Location", location)
 				w.WriteHeader(307)
 			}))
@@ -333,7 +370,7 @@ func TestRedirects(t *testing.T) {
 			p := New(time.Second)
 			p.client.Transport = s.Client().Transport
 			defer p.Close()
-			if f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil || calls.Load() > 4 {
+			if f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil || calls.Load() > 4 {
 				t.Fatalf("unsafe/excess redirect: %+v, %v, calls=%d", f, err, calls.Load())
 			}
 		})
@@ -351,12 +388,12 @@ func TestDeadlineAndCancellation(t *testing.T) {
 	p := New(30 * time.Millisecond)
 	defer p.Close()
 	start := time.Now()
-	if f, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil || time.Since(start) > time.Second {
+	if f, err := probeOne(p, context.Background(), targets.Candidate{URL: s.URL}); err == nil || f != nil || time.Since(start) > time.Second {
 		t.Fatalf("deadline: %+v, %v after %s", f, err, time.Since(start))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if f, err := p.Probe(ctx, targets.Candidate{URL: s.URL, Fallback: true}); err == nil || f != nil {
+	if f, err := probeOne(p, ctx, targets.Candidate{URL: s.URL, Fallback: true}); err == nil || f != nil {
 		t.Fatalf("cancelled probe: %+v, %v", f, err)
 	}
 }
