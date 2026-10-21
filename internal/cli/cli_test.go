@@ -28,7 +28,7 @@ func TestCommandInputsAndOutput(t *testing.T) {
 			w.WriteHeader(307)
 			return
 		}
-		if r.URL.Path != "/mcp" {
+		if r.URL.Path != "/mcp" && r.URL.Path != "/other-mcp" {
 			w.WriteHeader(404)
 			return
 		}
@@ -52,7 +52,8 @@ func TestCommandInputsAndOutput(t *testing.T) {
 		{"explicit stdin", []string{"-l", "-"}, s.URL},
 		{"combined", []string{"-list", path, "-u", s.URL}, s.URL + "/mcp"},
 		{"invalid mixed", []string{"-u", "ftp://invalid", "-u", s.URL}, "bad host\n"},
-		{"JSONL", []string{"-u", s.URL, "-json", "-v"}, ""},
+		{"JSONL/-json", []string{"-u", s.URL, "-u", s.URL + "/other-mcp", "-json", "-v"}, ""},
+		{"JSONL/-j", []string{"-u", s.URL, "-u", s.URL + "/other-mcp", "-j", "-v"}, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -60,10 +61,18 @@ func TestCommandInputsAndOutput(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit %d: %s", code, &errOut)
 			}
-			if tt.name == "JSONL" {
-				var f probe.Finding
-				if err := json.Unmarshal(out.Bytes(), &f); err != nil || f.URL != s.URL+"/mcp" || f.Input != s.URL || f.Method != "server/discover" {
-					t.Fatalf("JSONL output: %s, %v", &out, err)
+			if strings.HasPrefix(tt.name, "JSONL/") {
+				lines := strings.Split(out.String(), "\n")
+				if len(lines) != 3 || lines[2] != "" {
+					t.Fatalf("expected two newline-terminated JSON objects, got %q", &out)
+				}
+				want := map[string]string{s.URL + "/mcp": s.URL, s.URL + "/other-mcp": s.URL + "/other-mcp"}
+				for _, line := range lines[:2] {
+					var f probe.Finding
+					if err := json.Unmarshal([]byte(line), &f); err != nil || want[f.URL] == "" || f.Input != want[f.URL] || f.Method != "server/discover" || f.Transport != "streamable-http" {
+						t.Fatalf("JSONL finding: %s, %v", line, err)
+					}
+					delete(want, f.URL)
 				}
 				if errOut.Len() == 0 {
 					t.Fatal("verbose mode omitted unconfirmed diagnostics")
