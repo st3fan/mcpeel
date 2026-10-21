@@ -48,8 +48,8 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	flags.IntVar(&cfg.concurrency, "c", 10, "maximum concurrent candidate exchanges")
 	flags.DurationVar(&cfg.timeout, "timeout", 2500*time.Millisecond, "deadline per target endpoint (e.g. 2.5s)")
 	flags.BoolVar(&cfg.noSubdomain, "no-subdomain", false, "disable mcp. hostname expansion")
-	flags.BoolVar(&cfg.json, "j", false, "write confirmed findings as JSON Lines")
-	flags.BoolVar(&cfg.json, "json", false, "write confirmed findings as JSON Lines")
+	flags.BoolVar(&cfg.json, "j", false, "write confirmed endpoint transports as JSON Lines")
+	flags.BoolVar(&cfg.json, "json", false, "write confirmed endpoint transports as JSON Lines")
 	flags.BoolVar(&cfg.verbose, "v", false, "write unconfirmed candidate diagnostics to stderr")
 	flags.Usage = func() {
 		fmt.Fprintln(errOut, "Usage: mcpeel [-u host] [-l hosts.txt] [options]\n       cat hosts.txt | mcpeel\n\nDiscover MCP servers on supplied hosts and their mcp. hostnames.")
@@ -206,20 +206,28 @@ func scan(parent context.Context, cfg config, cs []targets.Candidate, p checker,
 	}()
 	encoder := json.NewEncoder(out)
 	encoder.SetEscapeHTML(false)
-	seen := make(map[string]bool)
+	byURL := make(map[string]int)
+	var findings []probe.Finding
 	var writeErr error
 	for r := range results {
 		if r.err != nil && cfg.verbose {
 			fmt.Fprintf(errOut, "mcpeel: %s: %v\n", r.candidate.URL, r.err)
 		}
 		for _, finding := range r.findings {
-			if seen[finding.URL] || writeErr != nil || ctx.Err() != nil {
+			if writeErr != nil || ctx.Err() != nil {
 				continue
 			}
-			seen[finding.URL] = true
+			if i, ok := byURL[finding.URL]; ok {
+				if cfg.json {
+					findings[i].Merge(finding)
+				}
+				continue
+			}
 			if cfg.json {
-				writeErr = encoder.Encode(finding)
+				byURL[finding.URL] = len(findings)
+				findings = append(findings, finding)
 			} else {
+				byURL[finding.URL] = 0
 				_, writeErr = fmt.Fprintln(out, finding.URL)
 			}
 			if writeErr != nil {
@@ -229,6 +237,15 @@ func scan(parent context.Context, cfg config, cs []targets.Candidate, p checker,
 	}
 	if writeErr != nil {
 		return fmt.Errorf("write findings: %w", writeErr)
+	}
+	// Aliases can reveal more transport evidence for a URL after its first result.
+	// Emit JSONL only after all candidates have completed so every record is complete.
+	if cfg.json && parent.Err() == nil {
+		for _, finding := range findings {
+			if err := encoder.Encode(finding); err != nil {
+				return fmt.Errorf("write findings: %w", err)
+			}
+		}
 	}
 	return parent.Err()
 }

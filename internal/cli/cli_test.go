@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,7 +73,7 @@ func TestCommandInputsAndOutput(t *testing.T) {
 				want := map[string]string{s.URL + "/mcp": s.URL, s.URL + "/other-mcp": s.URL + "/other-mcp"}
 				for _, line := range lines[:2] {
 					var f probe.Finding
-					if err := json.Unmarshal([]byte(line), &f); err != nil || want[f.URL] == "" || f.Input != want[f.URL] || f.Method != "server/discover" || f.Transport != "streamable-http" {
+					if err := json.Unmarshal([]byte(line), &f); err != nil || want[f.URL] == "" || f.Input != want[f.URL] || f.Method != "server/discover" || f.Transport != "streamable-http" || !reflect.DeepEqual(f.Transports, []string{probe.StreamableHTTP}) {
 						t.Fatalf("JSONL finding: %s, %v", line, err)
 					}
 					delete(want, f.URL)
@@ -287,5 +288,55 @@ func TestCommandTimeoutContinuesToOtherEndpoints(t *testing.T) {
 	case <-canceled:
 	case <-time.After(time.Second):
 		t.Fatal("stalled initialize stream was not canceled")
+	}
+}
+
+func TestScanCombinesTransportEvidence(t *testing.T) {
+	const endpoint = "https://found.invalid/mcp"
+	cs := testCandidates(3)
+	p := checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
+		transport, method, version, name := probe.StreamableHTTP, "server/discover", "2026-07-28", "http-fixture"
+		if c.URL == cs[0].URL {
+			transport, method, version, name = probe.HTTPSSE, "initialize", "2024-11-05", "sse-fixture"
+		} else if c.URL == cs[2].URL {
+			method, version, name = "initialize", "2025-11-25", "older-http-fixture"
+		}
+		info := &probe.ServerInfo{Name: name, Version: "1"}
+		versions := []string{version}
+		return []probe.Finding{{
+			Input: c.URL, URL: endpoint, Transports: []string{transport},
+			TransportDetails: map[string]probe.TransportEvidence{transport: {Method: method, ProtocolVersions: versions, ServerInfo: info}},
+			Transport:        transport, Method: method, ProtocolVersions: versions, ServerInfo: info,
+		}}, nil
+	})
+	for _, order := range [][]targets.Candidate{cs, {cs[2], cs[1], cs[0]}} {
+		for _, workers := range []int{1, 3} {
+			for _, structured := range []bool{false, true} {
+				t.Run(fmt.Sprintf("first=%s/workers=%d/json=%v", order[0].URL, workers, structured), func(t *testing.T) {
+					var out bytes.Buffer
+					if err := scan(context.Background(), config{concurrency: workers, json: structured}, order, p, &out, io.Discard); err != nil {
+						t.Fatal(err)
+					}
+					if !structured {
+						if out.String() != endpoint+"\n" {
+							t.Fatalf("plain output duplicated endpoint: %q", &out)
+						}
+						return
+					}
+					var f probe.Finding
+					if err := json.Unmarshal(out.Bytes(), &f); err != nil {
+						t.Fatalf("expected one combined JSON record: %s, %v", &out, err)
+					}
+					if f.URL != endpoint || !reflect.DeepEqual(f.Transports, []string{probe.StreamableHTTP, probe.HTTPSSE}) || len(f.TransportDetails) != 2 || f.Transport != probe.StreamableHTTP {
+						t.Fatalf("lost transport evidence while deduplicating: %+v", f)
+					}
+					httpDetail, sseDetail := f.TransportDetails[probe.StreamableHTTP], f.TransportDetails[probe.HTTPSSE]
+					if httpDetail.Method != "server/discover" || httpDetail.ServerInfo.Name != "http-fixture" || !reflect.DeepEqual(httpDetail.ProtocolVersions, []string{"2026-07-28", "2025-11-25"}) ||
+						sseDetail.ServerInfo.Name != "sse-fixture" || !reflect.DeepEqual(sseDetail.ProtocolVersions, []string{"2024-11-05"}) || !reflect.DeepEqual(f.ProtocolVersions, httpDetail.ProtocolVersions) || f.Method != httpDetail.Method || f.ServerInfo.Name != httpDetail.ServerInfo.Name {
+						t.Fatalf("combined metadata is inconsistent: %+v", f)
+					}
+				})
+			}
+		}
 	}
 }

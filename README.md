@@ -1,6 +1,6 @@
 # mcpeel
 
-Find HTTP-accessible MCP servers from a list of hosts. `mcpeel` checks a small set of endpoint paths and the `mcp.` hostname, then confirms findings through an MCP protocol exchange.
+Find HTTP-accessible MCP servers from a list of hosts. `mcpeel` checks a small set of endpoint paths and the `mcp.` hostname, then confirms whether each endpoint supports Streamable HTTP, legacy HTTP+SSE, or both.
 
 Requires Go 1.27.1 or later. Build or install the command:
 
@@ -25,13 +25,13 @@ Input can contain DNS names, IPv4 addresses, bracketed IPv6 addresses, ports, or
 | `-c` | Maximum concurrent candidate exchanges; default `10` |
 | `-timeout` | Deadline per target endpoint; default `2.5s` (e.g. `750ms` or `10s` to override) |
 | `-no-subdomain` | Disable `mcp.` hostname expansion |
-| `-j`, `-json` | Emit findings as JSON Lines |
+| `-j`, `-json` | Emit confirmed endpoint transports and evidence as JSON Lines |
 | `-v` | Show unconfirmed candidate diagnostics on stderr |
 | `-h` | Show help |
 
-File, target, and piped input can be combined. Inputs are collected before probing to deduplicate overlapping candidates; findings stream as workers finish. With no supplied input, the command shows usage. Ctrl-C cancels pending requests.
+File, target, and piped input can be combined. Inputs are collected before probing to deduplicate overlapping candidates. Plain URLs stream as workers finish; JSONL findings are emitted when scanning completes so evidence from aliases and redirects can be merged into one record per final URL. With no supplied input, the command shows usage. Ctrl-C cancels pending requests.
 
-Each generated endpoint URL has its own timeout budget, shared across discovery, initialization, version retries, and HTTPS-to-HTTP fallback. The different paths and hostnames generated from one input host have independent budgets. A timed-out endpoint does not stop the remaining scan.
+Each generated endpoint URL has its own timeout budget, shared across both transport checks, discovery, initialization, version retries, and HTTPS-to-HTTP fallback. The two transport checks run concurrently, so a stalled check cannot prevent the other transport from being confirmed. The different paths and hostnames generated from one input host have independent budgets. A timed-out endpoint does not stop the remaining scan.
 
 Each host is checked at `/`, `/mcp`, `/sse`, `/mcp/sse`, and `/api/mcp`. An explicit path and query are also checked exactly as supplied. For `example.com`, the same default paths are tried on `mcp.example.com`. These paths are heuristics, not standardized endpoint locations.
 
@@ -41,7 +41,11 @@ For schemeless inputs, HTTPS is tried first, with HTTP fallback only after a con
 
 Detection supports [current discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) (`2026-07-28`), [initialization-based HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`), and deprecated HTTP+SSE. JSON and SSE responses must contain a matching JSON-RPC response and a valid MCP result. Legacy SSE endpoints must advertise a POST endpoint on the same origin and complete initialization. Streams and responses are bounded to 1 MiB; initialization sessions receive a best-effort cleanup, bounded to an additional 250ms.
 
-Default output is one confirmed endpoint URL per line. `-j` or `-json` emits one JSON object per line, including the original input, final endpoint URL, transport, detection method, advertised protocol versions, and server identity when supplied. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
+Both transports are checked even when one succeeds. Streamable HTTP may encode its POST response as SSE; that alone does not confirm the legacy HTTP+SSE transport, which requires a GET stream advertising a separate POST channel and successful initialization. Only confirmed transports appear in results. An omitted transport can be unconfirmed because of a timeout or failed check; omission does not prove it is unsupported.
+
+Default output is one confirmed endpoint URL per line. `-j` or `-json` emits one JSON object per endpoint, including the original input, final URL, a `transports` list, and a `transport_details` object keyed by transport. Each detail contains its detection method, advertised protocol versions, and server identity when supplied. A dual-transport endpoint has `"transports": ["streamable-http", "http+sse"]`.
+
+The existing singular `transport`, `method`, `protocol_versions`, and `server_info` fields remain for compatibility. They describe the primary confirmed transport, preferring Streamable HTTP when both are found. Protocol versions from repeated observations of the same transport are combined, with discovery evidence preferred over initialization evidence. Different final URLs remain separate findings even when one input redirects its POST and GET requests differently. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
 
 HTML mentioning MCP, arbitrary JSON-RPC/SSE, and bare HTTP status codes do not confirm a server. Authentication-blocked endpoints can remain undiscovered; this version does not log in, crawl websites, scan ports, call tools, or fetch resources/prompts. Zero findings does not prove that no MCP server exists.
 
