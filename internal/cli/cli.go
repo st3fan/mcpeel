@@ -48,6 +48,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	flags.IntVar(&cfg.concurrency, "c", 10, "maximum concurrent candidate exchanges")
 	flags.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "deadline per candidate exchange (e.g. 5s)")
 	flags.BoolVar(&cfg.noSubdomain, "no-subdomain", false, "disable mcp. hostname expansion")
+	flags.BoolVar(&cfg.json, "j", false, "write confirmed findings as JSON Lines")
 	flags.BoolVar(&cfg.json, "json", false, "write confirmed findings as JSON Lines")
 	flags.BoolVar(&cfg.verbose, "v", false, "write unconfirmed candidate diagnostics to stderr")
 	flags.Usage = func() {

@@ -25,7 +25,7 @@ Input can contain DNS names, IPv4 addresses, bracketed IPv6 addresses, ports, or
 | `-c` | Maximum concurrent candidate exchanges; default `10` |
 | `-timeout` | Deadline per candidate exchange; default `5s` |
 | `-no-subdomain` | Disable `mcp.` hostname expansion |
-| `-json` | Emit findings as JSON Lines |
+| `-j`, `-json` | Emit findings as JSON Lines |
 | `-v` | Show unconfirmed candidate diagnostics on stderr |
 | `-h` | Show help |
 
@@ -39,7 +39,7 @@ For schemeless inputs, HTTPS is tried first, with HTTP fallback only after a con
 
 Detection supports [current discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) (`2026-07-28`), [initialization-based HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`), and deprecated HTTP+SSE. JSON and SSE responses must contain a matching JSON-RPC response and a valid MCP result. Legacy SSE endpoints must advertise a POST endpoint on the same origin and complete initialization. Streams and responses are bounded to 1 MiB; initialization sessions receive a best-effort cleanup, bounded to an additional 250ms.
 
-Default output is one confirmed endpoint URL per line. `-json` includes the original input, final endpoint URL, transport, detection method, advertised protocol versions, and server identity when supplied. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
+Default output is one confirmed endpoint URL per line. `-j` or `-json` emits one JSON object per line, including the original input, final endpoint URL, transport, detection method, advertised protocol versions, and server identity when supplied. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
 
 HTML mentioning MCP, arbitrary JSON-RPC/SSE, and bare HTTP status codes do not confirm a server. Authentication-blocked endpoints can remain undiscovered; this version does not log in, crawl websites, scan ports, call tools, or fetch resources/prompts. Zero findings does not prove that no MCP server exists.
 
