@@ -27,16 +27,6 @@ type ServerInfo struct {
 	Version string `json:"version"`
 }
 
-// Finding represents a confirmed protocol exchange, never just an HTTP status or URL match.
-type Finding struct {
-	Input            string      `json:"input"`
-	URL              string      `json:"url"`
-	Transport        string      `json:"transport"`
-	Method           string      `json:"method"`
-	ProtocolVersions []string    `json:"protocol_versions"`
-	ServerInfo       *ServerInfo `json:"server_info,omitempty"`
-}
-
 // Prober is safe for concurrent use. Its configuration must not change during a scan.
 type Prober struct {
 	client  *http.Client
@@ -56,17 +46,18 @@ func New(timeout time.Duration) *Prober {
 
 func (p *Prober) Close() { p.client.CloseIdleConnections() }
 
-// Probe uses one deadline for the exchange, including HTTPS fallback and protocol retries.
+// Probe checks both transports concurrently within one deadline, including HTTP
+// fallback and protocol retries. Distinct redirect destinations remain separate findings.
 // Cleanup has its own short deadline and still respects caller cancellation.
-func (p *Prober) Probe(parent context.Context, c targets.Candidate) (*Finding, error) {
+func (p *Prober) Probe(parent context.Context, c targets.Candidate) ([]Finding, error) {
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 	f, err, connectionFailure := p.probeURL(ctx, parent, c.URL)
-	if err != nil && connectionFailure && c.Fallback && strings.HasPrefix(c.URL, "https://") && ctx.Err() == nil {
+	if len(f) == 0 && connectionFailure && c.Fallback && strings.HasPrefix(c.URL, "https://") && ctx.Err() == nil {
 		f, err, _ = p.probeURL(ctx, parent, "http://"+strings.TrimPrefix(c.URL, "https://"))
 	}
-	if f != nil {
-		f.Input = c.Input
+	for i := range f {
+		f[i].Input = c.Input
 	}
 	return f, err
 }
@@ -108,11 +99,17 @@ func headers(method, version, session string) http.Header {
 // do follows at most three redirects, never changes POST to GET, and never crosses
 // hostnames or downgrades HTTPS. A response received before a redirect prevents fallback.
 func (p *Prober) do(ctx context.Context, method, endpoint string, body []byte, h http.Header) (*http.Response, error, bool) {
+	return p.exchange(ctx, method, endpoint, body, h, false)
+}
+
+// Legacy SSE's advertised POST channel stays on its origin even through redirects.
+func (p *Prober) exchange(ctx context.Context, method, endpoint string, body []byte, h http.Header, sameOrigin bool) (*http.Response, error, bool) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err, false
 	}
 	initialHost := u.Hostname()
+	initialScheme, initialAuthority := u.Scheme, u.Host
 	hadResponse := false
 	for redirects := 0; ; redirects++ {
 		req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
@@ -133,6 +130,9 @@ func (p *Prober) do(ctx context.Context, method, endpoint string, body []byte, h
 		allowedStatus := method == http.MethodGet || r.StatusCode == 307 || r.StatusCode == 308
 		allowed := err == nil && next.User == nil && next.Fragment == "" && strings.EqualFold(next.Hostname(), initialHost) &&
 			(next.Scheme == "http" || next.Scheme == "https") && !(u.Scheme == "https" && next.Scheme == "http")
+		if allowed && sameOrigin {
+			allowed = next.Scheme == initialScheme && strings.EqualFold(next.Host, initialAuthority)
+		}
 		if !allowedStatus || !allowed || redirects == 3 {
 			r.Body.Close()
 			return nil, fmt.Errorf("blocked or excessive redirect from %s", u.Redacted()), false
@@ -142,7 +142,50 @@ func (p *Prober) do(ctx context.Context, method, endpoint string, body []byte, h
 	}
 }
 
-func (p *Prober) probeURL(ctx, parent context.Context, endpoint string) (*Finding, error, bool) {
+type checkResult struct {
+	index             int
+	finding           *Finding
+	err               error
+	connectionFailure bool
+}
+
+func (p *Prober) probeURL(ctx, parent context.Context, endpoint string) ([]Finding, error, bool) {
+	results := make(chan checkResult, 2)
+	go func() {
+		f, err, failed := p.streamableHTTP(ctx, parent, endpoint)
+		results <- checkResult{0, f, err, failed}
+	}()
+	go func() {
+		f, err, failed := p.legacySSE(ctx, parent, endpoint)
+		results <- checkResult{1, f, err, failed}
+	}()
+	var checks [2]checkResult
+	for range checks {
+		r := <-results
+		checks[r.index] = r
+	}
+	var findings []Finding
+	byURL := make(map[string]int)
+	for _, r := range checks {
+		if r.finding == nil {
+			continue
+		}
+		if i, ok := byURL[r.finding.URL]; ok {
+			findings[i].Merge(*r.finding)
+		} else {
+			byURL[r.finding.URL] = len(findings)
+			findings = append(findings, *r.finding)
+		}
+	}
+	if len(findings) != 0 {
+		// A failed or timed-out check cannot erase evidence from the other transport.
+		return findings, nil, false
+	}
+	return nil, errors.Join(fmt.Errorf("%s unconfirmed: %w", StreamableHTTP, checks[0].err),
+		fmt.Errorf("%s unconfirmed: %w", HTTPSSE, checks[1].err)), checks[0].connectionFailure && checks[1].connectionFailure
+}
+
+func (p *Prober) streamableHTTP(ctx, parent context.Context, endpoint string) (*Finding, error, bool) {
 	r, err, failed := p.do(ctx, http.MethodPost, endpoint, requestBody("server/discover", modernVersion), headers("server/discover", modernVersion, ""))
 	if err != nil {
 		return nil, err, failed
@@ -166,17 +209,7 @@ func (p *Prober) probeURL(ctx, parent context.Context, endpoint string) (*Findin
 	if r.StatusCode == 401 || r.StatusCode == 403 || r.StatusCode >= 500 {
 		return nil, fmt.Errorf("unconfirmed endpoint: HTTP %d", r.StatusCode), false
 	}
-	f, status, err := p.initialize(ctx, parent, endpoint, nil)
-	if err == nil {
-		return f, nil, false
-	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err(), false
-	}
-	if status != 400 && status != 404 && status != 405 {
-		return nil, err, false
-	}
-	f, err = p.legacySSE(ctx, parent, endpoint)
+	f, _, err := p.initialize(ctx, parent, endpoint, nil)
 	return f, err, false
 }
 
@@ -206,7 +239,7 @@ func discoveryResult(raw json.RawMessage) (*Finding, error) {
 			return nil, errors.New("empty MCP protocol version")
 		}
 	}
-	return &Finding{Transport: "streamable-http", Method: "server/discover", ProtocolVersions: result.SupportedVersions, ServerInfo: result.Meta.ServerInfo}, nil
+	return newFinding("", StreamableHTTP, "server/discover", result.SupportedVersions, result.Meta.ServerInfo), nil
 }
 
 func initializeResult(raw json.RawMessage) (*Finding, error) {
@@ -219,7 +252,7 @@ func initializeResult(raw json.RawMessage) (*Finding, error) {
 		result.ServerInfo == nil || result.ServerInfo.Name == "" || result.ServerInfo.Version == "" {
 		return nil, errors.New("invalid or unsupported MCP initialize result")
 	}
-	return &Finding{Transport: "streamable-http", Method: "initialize", ProtocolVersions: []string{result.ProtocolVersion}, ServerInfo: result.ServerInfo}, nil
+	return newFinding("", StreamableHTTP, "initialize", []string{result.ProtocolVersion}, result.ServerInfo), nil
 }
 
 func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream *events) (*Finding, int, error) {
@@ -229,7 +262,7 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 	}
 	// One version retry at most, and only to a version explicitly advertised by the server.
 	for attempt := 0; attempt < 2; attempt++ {
-		r, err, _ := p.do(ctx, http.MethodPost, endpoint, requestBody("initialize", version), headers("initialize", version, ""))
+		r, err, _ := p.exchange(ctx, http.MethodPost, endpoint, requestBody("initialize", version), headers("initialize", version, ""), stream != nil)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -269,67 +302,66 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 		}
 		f.URL = endpoint
 		if session != "" {
-			defer p.cleanup(parent, endpoint, f.ProtocolVersions[0], session)
+			defer p.cleanup(parent, endpoint, f.ProtocolVersions[0], session, stream != nil)
 		}
-		p.initialized(ctx, endpoint, f.ProtocolVersions[0], session)
+		p.initialized(ctx, endpoint, f.ProtocolVersions[0], session, stream != nil)
 		return f, status, nil
 	}
 	return nil, 0, errors.New("no compatible initialize response")
 }
 
-func (p *Prober) initialized(ctx context.Context, endpoint, version, session string) {
+func (p *Prober) initialized(ctx context.Context, endpoint, version, session string, sameOrigin bool) {
 	ctx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 	body := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
-	r, err, _ := p.do(ctx, http.MethodPost, endpoint, body, headers("notifications/initialized", version, session))
+	r, err, _ := p.exchange(ctx, http.MethodPost, endpoint, body, headers("notifications/initialized", version, session), sameOrigin)
 	if err == nil {
 		io.Copy(io.Discard, io.LimitReader(r.Body, 4096))
 		r.Body.Close()
 	}
 }
 
-func (p *Prober) cleanup(parent context.Context, endpoint, version, session string) {
+func (p *Prober) cleanup(parent context.Context, endpoint, version, session string, sameOrigin bool) {
 	ctx, cancel := context.WithTimeout(parent, 250*time.Millisecond)
 	defer cancel()
-	r, err, _ := p.do(ctx, http.MethodDelete, endpoint, nil, headers("", version, session))
+	r, err, _ := p.exchange(ctx, http.MethodDelete, endpoint, nil, headers("", version, session), sameOrigin)
 	if err == nil {
 		r.Body.Close()
 	}
 }
 
-func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Finding, error) {
+func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Finding, error, bool) {
 	h := headers("", "", "")
 	h.Set("Accept", "text/event-stream")
-	r, err, _ := p.do(ctx, http.MethodGet, endpoint, nil, h)
+	r, err, failed := p.do(ctx, http.MethodGet, endpoint, nil, h)
 	if err != nil {
-		return nil, err
+		return nil, err, failed
 	}
 	defer r.Body.Close()
 	if r.StatusCode != 200 || contentType(r) != "text/event-stream" {
-		return nil, fmt.Errorf("not a legacy MCP event stream (HTTP %d)", r.StatusCode)
+		return nil, fmt.Errorf("not a legacy MCP event stream (HTTP %d)", r.StatusCode), false
 	}
 	stream := newEvents(r.Body)
 	for {
 		name, data, err := stream.next()
 		if err != nil {
-			return nil, err
+			return nil, err, false
 		}
 		if name != "endpoint" {
 			continue
 		}
 		ref, err := url.Parse(string(data))
 		if err != nil || ref.User != nil || ref.Fragment != "" {
-			return nil, errors.New("invalid SSE POST endpoint")
+			return nil, errors.New("invalid SSE POST endpoint"), false
 		}
 		postURL := r.Request.URL.ResolveReference(ref)
 		if postURL.Scheme != r.Request.URL.Scheme || !strings.EqualFold(postURL.Host, r.Request.URL.Host) {
-			return nil, errors.New("SSE POST endpoint is not on the same origin")
+			return nil, errors.New("SSE POST endpoint is not on the same origin"), false
 		}
 		f, _, err := p.initialize(ctx, parent, postURL.String(), stream)
 		if err != nil {
-			return nil, err
+			return nil, err, false
 		}
-		f.URL, f.Transport = r.Request.URL.String(), "http+sse"
-		return f, nil
+		return newFinding(r.Request.URL.String(), HTTPSSE, f.Method, f.ProtocolVersions, f.ServerInfo), nil, false
 	}
 }

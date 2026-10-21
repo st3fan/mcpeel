@@ -154,12 +154,12 @@ func load(ctx context.Context, cfg config, in io.Reader) ([]targets.Candidate, [
 }
 
 type checker interface {
-	Probe(context.Context, targets.Candidate) (*probe.Finding, error)
+	Probe(context.Context, targets.Candidate) ([]probe.Finding, error)
 }
 
 type result struct {
 	candidate targets.Candidate
-	finding   *probe.Finding
+	findings  []probe.Finding
 	err       error
 }
 
@@ -212,17 +212,19 @@ func scan(parent context.Context, cfg config, cs []targets.Candidate, p checker,
 		if r.err != nil && cfg.verbose {
 			fmt.Fprintf(errOut, "mcpeel: %s: %v\n", r.candidate.URL, r.err)
 		}
-		if r.finding == nil || seen[r.finding.URL] || writeErr != nil || ctx.Err() != nil {
-			continue
-		}
-		seen[r.finding.URL] = true
-		if cfg.json {
-			writeErr = encoder.Encode(r.finding)
-		} else {
-			_, writeErr = fmt.Fprintln(out, r.finding.URL)
-		}
-		if writeErr != nil {
-			cancel()
+		for _, finding := range r.findings {
+			if seen[finding.URL] || writeErr != nil || ctx.Err() != nil {
+				continue
+			}
+			seen[finding.URL] = true
+			if cfg.json {
+				writeErr = encoder.Encode(finding)
+			} else {
+				_, writeErr = fmt.Fprintln(out, finding.URL)
+			}
+			if writeErr != nil {
+				cancel()
+			}
 		}
 	}
 	if writeErr != nil {
