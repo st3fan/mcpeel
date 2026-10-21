@@ -49,6 +49,9 @@ func TestCommandInputsAndOutput(t *testing.T) {
 		{"file", []string{"-l", path}, ""},
 		{"file alias", []string{"-list", path}, ""},
 		{"target", []string{"-u", s.URL, "-target", s.URL + "/mcp"}, ""},
+		{"millisecond timeout", []string{"-u", s.URL, "-timeout", "750ms"}, ""},
+		{"fractional timeout", []string{"-u", s.URL, "-timeout", "2.5s"}, ""},
+		{"longer timeout", []string{"-u", s.URL, "-timeout", "10s"}, ""},
 		{"explicit stdin", []string{"-l", "-"}, s.URL},
 		{"combined", []string{"-list", path, "-u", s.URL}, s.URL + "/mcp"},
 		{"invalid mixed", []string{"-u", "ftp://invalid", "-u", s.URL}, "bad host\n"},
@@ -125,6 +128,8 @@ func TestCommandFailures(t *testing.T) {
 		{"invalid only", []string{"-u", "bad host"}, strings.NewReader(""), 1},
 		{"bad concurrency", []string{"-c", "0"}, strings.NewReader(""), 2},
 		{"bad timeout", []string{"-timeout", "0s"}, strings.NewReader(""), 2},
+		{"negative timeout", []string{"-timeout", "-1s"}, strings.NewReader(""), 2},
+		{"invalid timeout", []string{"-timeout", "oops"}, strings.NewReader(""), 2},
 		{"bad flag", []string{"-wat"}, strings.NewReader(""), 2},
 		{"positional", []string{"example.com"}, strings.NewReader(""), 2},
 		{"missing file", []string{"-l", filepath.Join(t.TempDir(), "missing")}, strings.NewReader(""), 1},
@@ -134,6 +139,9 @@ func TestCommandFailures(t *testing.T) {
 			var out, errOut bytes.Buffer
 			if code := Run(context.Background(), tt.args, tt.in, &out, &errOut); code != tt.code || out.Len() != 0 || errOut.Len() == 0 {
 				t.Fatalf("code=%d stdout=%q stderr=%q", code, &out, &errOut)
+			}
+			if tt.name == "help" && !strings.Contains(errOut.String(), "(default 2.5s)") {
+				t.Fatalf("help omitted the 2.5s default: %s", &errOut)
 			}
 		})
 	}
@@ -236,5 +244,44 @@ func TestNoFindingsIsSuccess(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := Run(context.Background(), []string{"-u", s.URL}, strings.NewReader(""), &out, &errOut); code != 0 || out.Len() != 0 || errOut.Len() != 0 {
 		t.Fatalf("zero findings: code=%d stdout=%q stderr=%q", code, &out, &errOut)
+	}
+}
+
+func TestCommandTimeoutContinuesToOtherEndpoints(t *testing.T) {
+	canceled := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/slow":
+			var req struct{ Method string }
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode request: %v", err)
+				return
+			}
+			if req.Method == "server/discover" {
+				w.WriteHeader(400)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, ": keepalive\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			close(canceled)
+		case "/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":"server/discover","result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{}}}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer s.Close()
+	var out, errOut bytes.Buffer
+	code := Run(context.Background(), []string{"-u", s.URL + "/slow", "-timeout", "30ms", "-c", "1", "-v"}, strings.NewReader(""), &out, &errOut)
+	if code != 0 || out.String() != s.URL+"/mcp\n" || !strings.Contains(errOut.String(), "context deadline exceeded") {
+		t.Fatalf("timed-out target interrupted scan: code=%d stdout=%q stderr=%q", code, &out, &errOut)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("stalled initialize stream was not canceled")
 	}
 }

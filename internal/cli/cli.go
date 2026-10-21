@@ -46,7 +46,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	flags.StringVar(&cfg.list, "l", "", "newline-delimited host file (- for stdin)")
 	flags.StringVar(&cfg.list, "list", "", "alias for -l")
 	flags.IntVar(&cfg.concurrency, "c", 10, "maximum concurrent candidate exchanges")
-	flags.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "deadline per candidate exchange (e.g. 5s)")
+	flags.DurationVar(&cfg.timeout, "timeout", 2500*time.Millisecond, "deadline per target endpoint (e.g. 2.5s)")
 	flags.BoolVar(&cfg.noSubdomain, "no-subdomain", false, "disable mcp. hostname expansion")
 	flags.BoolVar(&cfg.json, "j", false, "write confirmed findings as JSON Lines")
 	flags.BoolVar(&cfg.json, "json", false, "write confirmed findings as JSON Lines")

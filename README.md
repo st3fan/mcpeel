@@ -13,7 +13,7 @@ go install github.com/st3fan/mcpeel/cmd/mcpeel@latest
 cat hosts.txt | mcpeel
 mcpeel -l hosts.txt
 mcpeel -u example.com -u https://api.example.net/custom/mcp
-mcpeel -l hosts.txt -json -c 10 -timeout 5s
+mcpeel -l hosts.txt -json -c 10 -timeout 2.5s
 ```
 
 Input can contain DNS names, IPv4 addresses, bracketed IPv6 addresses, ports, or HTTP(S) URLs. Schemeless paths such as `example.com/mcp` also work. Blank lines and lines beginning with `#` are ignored. Repeated targets and candidate URLs are deduplicated. Invalid targets are reported to stderr while valid targets continue.
@@ -23,13 +23,15 @@ Input can contain DNS names, IPv4 addresses, bracketed IPv6 addresses, ports, or
 | `-u`, `-target` | Target host or URL; repeat for multiple targets |
 | `-l`, `-list` | Newline-delimited input file; `-` reads stdin |
 | `-c` | Maximum concurrent candidate exchanges; default `10` |
-| `-timeout` | Deadline per candidate exchange; default `5s` |
+| `-timeout` | Deadline per target endpoint; default `2.5s` (e.g. `750ms` or `10s` to override) |
 | `-no-subdomain` | Disable `mcp.` hostname expansion |
 | `-j`, `-json` | Emit findings as JSON Lines |
 | `-v` | Show unconfirmed candidate diagnostics on stderr |
 | `-h` | Show help |
 
 File, target, and piped input can be combined. Inputs are collected before probing to deduplicate overlapping candidates; findings stream as workers finish. With no supplied input, the command shows usage. Ctrl-C cancels pending requests.
+
+Each generated endpoint URL has its own timeout budget, shared across discovery, initialization, version retries, and HTTPS-to-HTTP fallback. The different paths and hostnames generated from one input host have independent budgets. A timed-out endpoint does not stop the remaining scan.
 
 Each host is checked at `/`, `/mcp`, `/sse`, `/mcp/sse`, and `/api/mcp`. An explicit path and query are also checked exactly as supplied. For `example.com`, the same default paths are tried on `mcp.example.com`. These paths are heuristics, not standardized endpoint locations.
 
