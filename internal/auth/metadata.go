@@ -60,10 +60,14 @@ func (r *Resolver) Enrich(ctx context.Context, o Observation) Observation {
 	}
 	if len(candidates) == 0 && (bearer || o.HTTPStatus == 401 && len(o.Schemes) == 0) {
 		path := *endpoint
-		path.Path = "/.well-known/oauth-protected-resource" + strings.TrimSuffix(endpoint.Path, "/")
+		suffix, escapedSuffix := endpoint.Path, endpoint.EscapedPath()
+		if endpoint.Path == "/" {
+			suffix, escapedSuffix = "", ""
+		}
+		path.Path = "/.well-known/oauth-protected-resource" + suffix
 		path.RawPath = ""
 		if endpoint.RawPath != "" {
-			path.RawPath = "/.well-known/oauth-protected-resource" + strings.TrimSuffix(endpoint.EscapedPath(), "/")
+			path.RawPath = "/.well-known/oauth-protected-resource" + escapedSuffix
 		}
 		candidates = append(candidates, candidate{path.String(), "well_known_endpoint"})
 		root := *endpoint

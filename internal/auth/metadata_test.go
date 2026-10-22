@@ -112,3 +112,31 @@ func TestMetadataDeduplicationAndBudget(t *testing.T) {
 		t.Fatalf("metadata request budget exceeded: %d", calls.Load())
 	}
 }
+
+func TestMetadataDiscoveryPreservesResourcePath(t *testing.T) {
+	for _, suffix := range []string{"/", "/mcp/", "/mcp%2F", "/tenant%20one/mcp?version=1%2F2", "/mcp?"} {
+		t.Run(suffix, func(t *testing.T) {
+			var resource string
+			var requests []string
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.RequestURI)
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"resource":%q}`, resource)
+			}))
+			defer s.Close()
+			resource = s.URL + suffix
+			resolver := NewResolver(func(ctx context.Context, target string) (*http.Response, error) {
+				req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
+				return s.Client().Do(req)
+			})
+			o := resolver.Enrich(context.Background(), Observation{URL: resource, HTTPStatus: 401})
+			want := "/.well-known/oauth-protected-resource"
+			if suffix != "/" {
+				want += suffix
+			}
+			if !o.OAuthAdvertised || len(requests) != 1 || requests[0] != want || o.Metadata[0].Resource != resource {
+				t.Fatalf("requests=%v want=%s observation=%+v", requests, want, o)
+			}
+		})
+	}
+}
