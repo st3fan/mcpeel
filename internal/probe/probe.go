@@ -217,9 +217,8 @@ func (p *Prober) streamableHTTP(ctx, parent context.Context, endpoint string) (*
 			return nil, fmt.Errorf("modern MCP protocol error %d", e.Error.Code), false
 		}
 	}
-	if r.StatusCode == 401 || r.StatusCode == 403 || r.StatusCode >= 500 {
-		return nil, fmt.Errorf("unconfirmed endpoint: HTTP %d", r.StatusCode), false
-	}
+	// Initialization-based servers can return 5xx for unsupported discovery.
+	// Only a valid initialization response can confirm the fallback transport.
 	f, _, err := p.initialize(ctx, parent, endpoint, nil)
 	return f, err, false
 }
