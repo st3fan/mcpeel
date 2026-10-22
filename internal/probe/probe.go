@@ -197,6 +197,7 @@ func (p *Prober) streamableHTTP(ctx, parent context.Context, endpoint string) (*
 		f, err := discoveryResult(e.Result)
 		if err == nil {
 			f.URL = endpoint
+			f.setResponseHeaders(r.Header)
 			return f, nil, false
 		}
 	}
@@ -301,6 +302,7 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 			return nil, status, err
 		}
 		f.URL = endpoint
+		f.setResponseHeaders(r.Header)
 		if session != "" {
 			defer p.cleanup(parent, endpoint, f.ProtocolVersions[0], session, stream != nil)
 		}
@@ -362,6 +364,12 @@ func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Findi
 		if err != nil {
 			return nil, err, false
 		}
-		return newFinding(r.Request.URL.String(), HTTPSSE, f.Method, f.ProtocolVersions, f.ServerInfo), nil, false
+		legacy := newFinding(r.Request.URL.String(), HTTPSSE, f.Method, f.ProtocolVersions, f.ServerInfo)
+		legacy.setResponseHeaders(r.Header)
+		detail := legacy.TransportDetails[HTTPSSE]
+		detail.PostEndpoint = f.URL
+		detail.PostResponseHeaders = copyHeaders(f.TransportDetails[StreamableHTTP].ResponseHeaders)
+		legacy.TransportDetails[HTTPSSE] = detail
+		return legacy, nil, false
 	}
 }

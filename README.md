@@ -45,6 +45,16 @@ Both transports are checked even when one succeeds. Streamable HTTP may encode i
 
 Default output is one confirmed endpoint URL per line. `-j` or `-json` emits one JSON object per endpoint, including the original input, final URL, a `transports` list, and a `transport_details` object keyed by transport. Each detail contains its detection method, advertised protocol versions, and server identity when supplied. A dual-transport endpoint has `"transports": ["streamable-http", "http+sse"]`.
 
+Each transport detail also contains `response_headers` from its final confirming HTTP response. Streamable HTTP uses the discovery or initialization POST response; legacy HTTP+SSE uses the endpoint's GET stream response. Legacy SSE additionally includes `post_endpoint` and `post_response_headers` for its initialization POST channel. Header names use canonical HTTP casing, and values are arrays that preserve repeated fields such as `Set-Cookie`.
+
+For example, the header portion of a JSONL finding can contain:
+
+```json
+{"response_headers":{"Content-Type":["application/json"],"Set-Cookie":["a=1; Path=/","b=2; Path=/"]}}
+```
+
+When aliases are combined, headers follow the selected confirmation evidence. Redirect, failed-probe, initialization-notification, and cleanup response headers are excluded from that evidence.
+
 The existing singular `transport`, `method`, `protocol_versions`, and `server_info` fields remain for compatibility. They describe the primary confirmed transport, preferring Streamable HTTP when both are found. Protocol versions from repeated observations of the same transport are combined, with discovery evidence preferred over initialization evidence. Different final URLs remain separate findings even when one input redirects its POST and GET requests differently. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
 
 HTML mentioning MCP, arbitrary JSON-RPC/SSE, and bare HTTP status codes do not confirm a server. Authentication-blocked endpoints can remain undiscovered; this version does not log in, crawl websites, scan ports, call tools, or fetch resources/prompts. Zero findings does not prove that no MCP server exists.
