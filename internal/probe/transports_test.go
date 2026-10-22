@@ -16,9 +16,9 @@ import (
 )
 
 type transportFixture struct {
-	http, sse, streamedHTTP, initializeHTTP bool
-	stallHTTP, stallSSE, badSSE, genericSSE bool
-	crossOrigin, splitRedirects             bool
+	http, sse, streamedHTTP, initializeHTTP   bool
+	stallHTTP, stallSSE, badSSE, genericSSE   bool
+	crossOrigin, splitRedirects, redirectPost bool
 }
 
 type transportState struct {
@@ -37,12 +37,15 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 				location = "/sse"
 			}
 			w.Header().Set("Location", location)
+			w.Header().Set("X-Phase", "redirect")
 			w.WriteHeader(307)
 			return
 		}
 		if r.Method == http.MethodDelete {
+			w.Header().Set("X-Phase", "cleanup")
+			w.Header().Set("X-Cleanup-Only", "true")
 			wantSession := "http-session"
-			if r.URL.Path == "/messages" {
+			if r.URL.Path == "/messages" || r.URL.Path == "/messages-final" {
 				wantSession = "sse-session"
 			}
 			if r.Header.Get("Mcp-Session-Id") != wantSession {
@@ -59,6 +62,9 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 			}
 			defer close(state.closed)
 			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Phase", "sse-get")
+			w.Header().Add("Set-Cookie", "sse-a=1; Path=/")
+			w.Header().Add("Set-Cookie", "sse-b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT")
 			if cfg.stallSSE {
 				fmt.Fprint(w, ": keepalive\n\n")
 				w.(http.Flusher).Flush()
@@ -86,10 +92,18 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 		}
 		req := request(t, r)
 		if req.Method == "notifications/initialized" {
+			w.Header().Set("X-Phase", "notification")
+			w.Header().Set("X-Notification-Only", "true")
 			w.WriteHeader(202)
 			return
 		}
-		if r.URL.Path == "/messages" {
+		if r.URL.Path == "/messages" && cfg.redirectPost {
+			w.Header().Set("Location", "/messages-final")
+			w.Header().Set("X-Phase", "redirect")
+			w.WriteHeader(307)
+			return
+		}
+		if r.URL.Path == "/messages" || r.URL.Path == "/messages-final" {
 			if req.Params.Version != "2024-11-05" {
 				t.Errorf("legacy initialize version: %s", req.Params.Version)
 			}
@@ -103,6 +117,8 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 			b, _ := json.Marshal(result)
 			responses <- b
 			w.Header().Set("Mcp-Session-Id", "sse-session")
+			w.Header().Set("X-Phase", "sse-post")
+			w.Header().Add("Set-Cookie", "post-a=3; Path=/")
 			w.WriteHeader(202)
 			return
 		}
@@ -119,13 +135,21 @@ func newTransportFixture(t *testing.T, cfg transportFixture) (*httptest.Server, 
 		}
 		if cfg.initializeHTTP {
 			if req.Method == "server/discover" {
+				w.Header().Set("X-Phase", "error")
+				w.Header().Set("X-Error-Only", "true")
 				w.WriteHeader(400)
 				return
 			}
 			w.Header().Set("Mcp-Session-Id", "http-session")
+			w.Header().Set("X-Phase", "http-initialize")
+			w.Header().Add("Set-Cookie", "http-a=1; Path=/")
+			w.Header().Add("Set-Cookie", "http-b=2; Path=/")
 			reply(w, req.ID, initializedResult("2025-11-25"), cfg.streamedHTTP)
 			return
 		}
+		w.Header().Set("X-Phase", "http-discover")
+		w.Header().Add("Set-Cookie", "http-a=1; Path=/")
+		w.Header().Add("Set-Cookie", "http-b=2; Path=/")
 		reply(w, req.ID, discovery(), cfg.streamedHTTP)
 	}))
 	t.Cleanup(s.Close)
@@ -141,6 +165,7 @@ func TestSupportedTransports(t *testing.T) {
 		{"HTTP JSON", transportFixture{http: true}, []string{StreamableHTTP}},
 		{"HTTP streamed", transportFixture{http: true, streamedHTTP: true}, []string{StreamableHTTP}},
 		{"legacy SSE", transportFixture{sse: true}, []string{HTTPSSE}},
+		{"legacy POST redirect", transportFixture{sse: true, redirectPost: true}, []string{HTTPSSE}},
 		{"both", transportFixture{http: true, sse: true}, []string{StreamableHTTP, HTTPSSE}},
 		{"both with sessions", transportFixture{http: true, sse: true, initializeHTTP: true}, []string{StreamableHTTP, HTTPSSE}},
 		{"failed SSE initialization", transportFixture{http: true, sse: true, badSSE: true}, []string{StreamableHTTP}},
@@ -183,6 +208,29 @@ func TestSupportedTransports(t *testing.T) {
 				if len(detail.ProtocolVersions) != 1 || detail.ProtocolVersions[0] != version || detail.ServerInfo == nil || detail.ServerInfo.Name != name {
 					t.Fatalf("evidence mixed between transports: %+v", f)
 				}
+				phase := "http-discover"
+				cookies := []string{"http-a=1; Path=/", "http-b=2; Path=/"}
+				if transport == HTTPSSE {
+					phase = "sse-get"
+					cookies = []string{"sse-a=1; Path=/", "sse-b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT"}
+					postPath := "/messages"
+					if tt.cfg.redirectPost {
+						postPath = "/messages-final"
+					}
+					if detail.PostEndpoint != s.URL+postPath || detail.PostResponseHeaders.Get("X-Phase") != "sse-post" || !reflect.DeepEqual(detail.PostResponseHeaders.Values("Set-Cookie"), []string{"post-a=3; Path=/"}) {
+						t.Fatalf("legacy POST headers or final URL were lost: %+v", detail)
+					}
+				} else if tt.cfg.initializeHTTP {
+					phase = "http-initialize"
+				}
+				if detail.ResponseHeaders.Get("X-Phase") != phase || !reflect.DeepEqual(detail.ResponseHeaders.Values("Set-Cookie"), cookies) {
+					t.Fatalf("incorrect confirming response headers: %+v", detail)
+				}
+				for _, headers := range []http.Header{detail.ResponseHeaders, detail.PostResponseHeaders} {
+					if headers.Get("Location") != "" || headers.Get("X-Error-Only") != "" || headers.Get("X-Notification-Only") != "" || headers.Get("X-Cleanup-Only") != "" {
+						t.Fatalf("headers from a different exchange leaked into confirmation: %v", headers)
+					}
+				}
 			}
 			if tt.cfg.initializeHTTP && state.deleted.Load() != 2 {
 				t.Fatalf("not all sessions cleaned up: %d", state.deleted.Load())
@@ -206,6 +254,9 @@ func TestDifferentTransportRedirects(t *testing.T) {
 	if err != nil || len(findings) != 2 || findings[0].URL != s.URL+"/mcp" || findings[1].URL != s.URL+"/sse" ||
 		!reflect.DeepEqual(findings[0].Transports, []string{StreamableHTTP}) || !reflect.DeepEqual(findings[1].Transports, []string{HTTPSSE}) {
 		t.Fatalf("different final URLs were combined: %+v, %v", findings, err)
+	}
+	if findings[0].TransportDetails[StreamableHTTP].ResponseHeaders.Get("X-Phase") != "http-discover" || findings[1].TransportDetails[HTTPSSE].ResponseHeaders.Get("X-Phase") != "sse-get" {
+		t.Fatalf("captured redirect headers instead of final responses: %+v", findings)
 	}
 }
 

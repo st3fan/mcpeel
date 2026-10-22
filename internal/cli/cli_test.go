@@ -34,6 +34,9 @@ func TestCommandInputsAndOutput(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Endpoint", r.URL.Path)
+		w.Header().Add("Set-Cookie", "a=1; Path=/")
+		w.Header().Add("Set-Cookie", "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT")
 		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"server/discover","result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{}}}`)
 	}))
 	defer s.Close()
@@ -75,6 +78,10 @@ func TestCommandInputsAndOutput(t *testing.T) {
 					var f probe.Finding
 					if err := json.Unmarshal([]byte(line), &f); err != nil || want[f.URL] == "" || f.Input != want[f.URL] || f.Method != "server/discover" || f.Transport != "streamable-http" || !reflect.DeepEqual(f.Transports, []string{probe.StreamableHTTP}) {
 						t.Fatalf("JSONL finding: %s, %v", line, err)
+					}
+					headers := f.TransportDetails[probe.StreamableHTTP].ResponseHeaders
+					if headers.Get("X-Endpoint") != strings.TrimPrefix(f.URL, s.URL) || !reflect.DeepEqual(headers.Values("Set-Cookie"), []string{"a=1; Path=/", "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT"}) {
+						t.Fatalf("JSONL lost endpoint response headers: %s", line)
 					}
 					delete(want, f.URL)
 				}
@@ -303,9 +310,17 @@ func TestScanCombinesTransportEvidence(t *testing.T) {
 		}
 		info := &probe.ServerInfo{Name: name, Version: "1"}
 		versions := []string{version}
+		detail := probe.TransportEvidence{
+			Method: method, ProtocolVersions: versions, ServerInfo: info,
+			ResponseHeaders: http.Header{"X-Fixture": {name}, "Set-Cookie": {name + "-a=1", name + "-b=2"}},
+		}
+		if transport == probe.HTTPSSE {
+			detail.PostEndpoint = "https://found.invalid/messages"
+			detail.PostResponseHeaders = http.Header{"X-Fixture": {"sse-post"}}
+		}
 		return []probe.Finding{{
 			Input: c.URL, URL: endpoint, Transports: []string{transport},
-			TransportDetails: map[string]probe.TransportEvidence{transport: {Method: method, ProtocolVersions: versions, ServerInfo: info}},
+			TransportDetails: map[string]probe.TransportEvidence{transport: detail},
 			Transport:        transport, Method: method, ProtocolVersions: versions, ServerInfo: info,
 		}}, nil
 	})
@@ -334,6 +349,11 @@ func TestScanCombinesTransportEvidence(t *testing.T) {
 					if httpDetail.Method != "server/discover" || httpDetail.ServerInfo.Name != "http-fixture" || !reflect.DeepEqual(httpDetail.ProtocolVersions, []string{"2026-07-28", "2025-11-25"}) ||
 						sseDetail.ServerInfo.Name != "sse-fixture" || !reflect.DeepEqual(sseDetail.ProtocolVersions, []string{"2024-11-05"}) || !reflect.DeepEqual(f.ProtocolVersions, httpDetail.ProtocolVersions) || f.Method != httpDetail.Method || f.ServerInfo.Name != httpDetail.ServerInfo.Name {
 						t.Fatalf("combined metadata is inconsistent: %+v", f)
+					}
+					if httpDetail.ResponseHeaders.Get("X-Fixture") != "http-fixture" || sseDetail.ResponseHeaders.Get("X-Fixture") != "sse-fixture" ||
+						!reflect.DeepEqual(httpDetail.ResponseHeaders.Values("Set-Cookie"), []string{"http-fixture-a=1", "http-fixture-b=2"}) ||
+						sseDetail.PostEndpoint != "https://found.invalid/messages" || sseDetail.PostResponseHeaders.Get("X-Fixture") != "sse-post" {
+						t.Fatalf("deduplication mixed response headers: %+v", f)
 					}
 				})
 			}

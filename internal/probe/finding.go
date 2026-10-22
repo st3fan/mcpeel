@@ -1,6 +1,9 @@
 package probe
 
-import "slices"
+import (
+	"net/http"
+	"slices"
+)
 
 const (
 	StreamableHTTP = "streamable-http"
@@ -9,9 +12,12 @@ const (
 
 // TransportEvidence records a successful protocol exchange for one transport.
 type TransportEvidence struct {
-	Method           string      `json:"method"`
-	ProtocolVersions []string    `json:"protocol_versions"`
-	ServerInfo       *ServerInfo `json:"server_info,omitempty"`
+	Method              string      `json:"method"`
+	ProtocolVersions    []string    `json:"protocol_versions"`
+	ServerInfo          *ServerInfo `json:"server_info,omitempty"`
+	ResponseHeaders     http.Header `json:"response_headers"`
+	PostEndpoint        string      `json:"post_endpoint,omitempty"`
+	PostResponseHeaders http.Header `json:"post_response_headers,omitempty"`
 }
 
 // Finding represents confirmed transports at one final endpoint URL. The singular
@@ -60,6 +66,8 @@ func (f *Finding) Merge(other Finding) {
 			detail.ServerInfo = incoming.ServerInfo
 		}
 		detail.ProtocolVersions = versions
+		detail.ResponseHeaders = copyHeaders(detail.ResponseHeaders)
+		detail.PostResponseHeaders = copyHeaders(detail.PostResponseHeaders)
 		f.TransportDetails[transport] = detail
 	}
 	f.Transports = nil
@@ -73,4 +81,24 @@ func (f *Finding) Merge(other Finding) {
 		detail := f.TransportDetails[f.Transport]
 		f.Method, f.ProtocolVersions, f.ServerInfo = detail.Method, detail.ProtocolVersions, detail.ServerInfo
 	}
+}
+
+// copyHeaders retains every value while making the finding independent of the
+// response or another finding. net/http's usual canonical field names are used.
+func copyHeaders(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	cloned := make(http.Header, len(headers))
+	for name, values := range headers {
+		name = http.CanonicalHeaderKey(name)
+		cloned[name] = append(cloned[name], values...)
+	}
+	return cloned
+}
+
+func (f *Finding) setResponseHeaders(headers http.Header) {
+	detail := f.TransportDetails[f.Transport]
+	detail.ResponseHeaders = copyHeaders(headers)
+	f.TransportDetails[f.Transport] = detail
 }
