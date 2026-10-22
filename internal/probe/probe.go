@@ -52,14 +52,13 @@ func (p *Prober) Close() { p.client.CloseIdleConnections() }
 func (p *Prober) Probe(parent context.Context, c targets.Candidate) ([]Finding, error) {
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
+	log := newAuthLog(p)
+	ctx = context.WithValue(ctx, authTraceKey{}, authTrace{log: log})
 	f, err, connectionFailure := p.probeURL(ctx, parent, c.URL)
 	if len(f) == 0 && connectionFailure && c.Fallback && strings.HasPrefix(c.URL, "https://") && ctx.Err() == nil {
 		f, err, _ = p.probeURL(ctx, parent, "http://"+strings.TrimPrefix(c.URL, "https://"))
 	}
-	for i := range f {
-		f[i].Input = c.Input
-	}
-	return f, err
+	return log.finish(f, c.Input), err
 }
 
 func requestBody(method, version string) []byte {
@@ -119,8 +118,10 @@ func (p *Prober) exchange(ctx context.Context, method, endpoint string, body []b
 		req.Header = h.Clone()
 		r, err := p.client.Do(req)
 		if err != nil {
+			recordFailure(ctx, method, u.String(), err)
 			return nil, err, !hadResponse && ctx.Err() == nil
 		}
+		recordResponse(ctx, r)
 		hadResponse = true
 		if r.StatusCode < 300 || r.StatusCode > 399 || r.Header.Get("Location") == "" {
 			return r, nil, false
@@ -134,8 +135,10 @@ func (p *Prober) exchange(ctx context.Context, method, endpoint string, body []b
 			allowed = next.Scheme == initialScheme && strings.EqualFold(next.Host, initialAuthority)
 		}
 		if !allowedStatus || !allowed || redirects == 3 {
+			err := fmt.Errorf("blocked or excessive redirect from %s", u.Redacted())
+			recordResponseError(ctx, r, err, true)
 			r.Body.Close()
-			return nil, fmt.Errorf("blocked or excessive redirect from %s", u.Redacted()), false
+			return nil, err, false
 		}
 		r.Body.Close()
 		u = next
@@ -186,18 +189,25 @@ func (p *Prober) probeURL(ctx, parent context.Context, endpoint string) ([]Findi
 }
 
 func (p *Prober) streamableHTTP(ctx, parent context.Context, endpoint string) (*Finding, error, bool) {
+	ctx = authStage(ctx, StreamableHTTP, "server/discover", "")
 	r, err, failed := p.do(ctx, http.MethodPost, endpoint, requestBody("server/discover", modernVersion), headers("server/discover", modernVersion, ""))
 	if err != nil {
 		return nil, err, failed
 	}
 	endpoint = r.Request.URL.String()
+	if r.StatusCode == 401 || r.StatusCode == 403 {
+		r.Body.Close()
+		return nil, fmt.Errorf("unconfirmed endpoint: HTTP %d", r.StatusCode), false
+	}
 	e, replyErr := readReply(r, "server/discover")
+	recordResponseError(ctx, r, replyErr, false)
 	r.Body.Close()
 	if replyErr == nil && e.Error == nil && r.StatusCode >= 200 && r.StatusCode < 300 {
 		f, err := discoveryResult(e.Result)
 		if err == nil {
 			f.URL = endpoint
 			f.setResponseHeaders(r.Header)
+			markAnonymous(ctx, r)
 			return f, nil, false
 		}
 	}
@@ -257,6 +267,12 @@ func initializeResult(raw json.RawMessage) (*Finding, error) {
 }
 
 func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream *events) (*Finding, int, error) {
+	trace, _ := ctx.Value(authTraceKey{}).(authTrace)
+	transport := StreamableHTTP
+	if stream != nil {
+		transport = HTTPSSE
+	}
+	ctx = authStage(ctx, transport, "initialize", trace.group)
 	version := legacyVersions[0]
 	if stream != nil {
 		version = "2024-11-05"
@@ -269,6 +285,10 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 		}
 		endpoint = r.Request.URL.String()
 		status, session := r.StatusCode, r.Header.Get("Mcp-Session-Id")
+		if status == 401 || status == 403 {
+			r.Body.Close()
+			return nil, status, fmt.Errorf("initialize requires access: HTTP %d", status)
+		}
 		var e envelope
 		if stream != nil && status == http.StatusAccepted {
 			r.Body.Close()
@@ -278,6 +298,7 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 			r.Body.Close()
 		}
 		if err != nil {
+			recordResponseError(ctx, r, err, false)
 			return nil, status, err
 		}
 		if e.Error != nil {
@@ -303,6 +324,7 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 		}
 		f.URL = endpoint
 		f.setResponseHeaders(r.Header)
+		markAnonymous(ctx, r)
 		if session != "" {
 			defer p.cleanup(parent, endpoint, f.ProtocolVersions[0], session, stream != nil)
 		}
@@ -313,6 +335,7 @@ func (p *Prober) initialize(ctx, parent context.Context, endpoint string, stream
 }
 
 func (p *Prober) initialized(ctx context.Context, endpoint, version, session string, sameOrigin bool) {
+	ctx = noAuthTrace(ctx)
 	ctx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 	body := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
@@ -324,6 +347,7 @@ func (p *Prober) initialized(ctx context.Context, endpoint, version, session str
 }
 
 func (p *Prober) cleanup(parent context.Context, endpoint, version, session string, sameOrigin bool) {
+	parent = noAuthTrace(parent)
 	ctx, cancel := context.WithTimeout(parent, 250*time.Millisecond)
 	defer cancel()
 	r, err, _ := p.exchange(ctx, http.MethodDelete, endpoint, nil, headers("", version, session), sameOrigin)
@@ -333,6 +357,7 @@ func (p *Prober) cleanup(parent context.Context, endpoint, version, session stri
 }
 
 func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Finding, error, bool) {
+	ctx = authStage(ctx, HTTPSSE, "sse", "")
 	h := headers("", "", "")
 	h.Set("Accept", "text/event-stream")
 	r, err, failed := p.do(ctx, http.MethodGet, endpoint, nil, h)
@@ -347,6 +372,7 @@ func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Findi
 	for {
 		name, data, err := stream.next()
 		if err != nil {
+			recordResponseError(ctx, r, err, false)
 			return nil, err, false
 		}
 		if name != "endpoint" {
@@ -360,11 +386,13 @@ func (p *Prober) legacySSE(ctx, parent context.Context, endpoint string) (*Findi
 		if postURL.Scheme != r.Request.URL.Scheme || !strings.EqualFold(postURL.Host, r.Request.URL.Host) {
 			return nil, errors.New("SSE POST endpoint is not on the same origin"), false
 		}
-		f, _, err := p.initialize(ctx, parent, postURL.String(), stream)
+		initCtx := authStage(ctx, HTTPSSE, "initialize", r.Request.URL.String())
+		f, _, err := p.initialize(initCtx, parent, postURL.String(), stream)
 		if err != nil {
 			return nil, err, false
 		}
 		legacy := newFinding(r.Request.URL.String(), HTTPSSE, f.Method, f.ProtocolVersions, f.ServerInfo)
+		markAnonymous(ctx, r)
 		legacy.setResponseHeaders(r.Header)
 		detail := legacy.TransportDetails[HTTPSSE]
 		detail.PostEndpoint = f.URL

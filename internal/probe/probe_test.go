@@ -28,6 +28,13 @@ type rpcRequest struct {
 
 func probeOne(p *Prober, ctx context.Context, c targets.Candidate) (*Finding, error) {
 	findings, err := p.Probe(ctx, c)
+	confirmed := findings[:0]
+	for _, f := range findings {
+		if f.MCPConfirmed {
+			confirmed = append(confirmed, f)
+		}
+	}
+	findings = confirmed
 	if len(findings) == 0 {
 		return nil, err
 	}

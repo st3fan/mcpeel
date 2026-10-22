@@ -48,8 +48,8 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	flags.IntVar(&cfg.concurrency, "c", 10, "maximum concurrent candidate exchanges")
 	flags.DurationVar(&cfg.timeout, "timeout", 2500*time.Millisecond, "deadline per target endpoint (e.g. 2.5s)")
 	flags.BoolVar(&cfg.noSubdomain, "no-subdomain", false, "disable mcp. hostname expansion")
-	flags.BoolVar(&cfg.json, "j", false, "write confirmed endpoint transports as JSON Lines")
-	flags.BoolVar(&cfg.json, "json", false, "write confirmed endpoint transports as JSON Lines")
+	flags.BoolVar(&cfg.json, "j", false, "write endpoint and authentication observations as JSON Lines")
+	flags.BoolVar(&cfg.json, "json", false, "write endpoint and authentication observations as JSON Lines")
 	flags.BoolVar(&cfg.verbose, "v", false, "write unconfirmed candidate diagnostics to stderr")
 	flags.Usage = func() {
 		fmt.Fprintln(errOut, "Usage: mcpeel [-u host] [-l hosts.txt] [options]\n       cat hosts.txt | mcpeel\n\nDiscover MCP servers on supplied hosts and their mcp. hostnames.")
@@ -214,6 +214,9 @@ func scan(parent context.Context, cfg config, cs []targets.Candidate, p checker,
 			fmt.Fprintf(errOut, "mcpeel: %s: %v\n", r.candidate.URL, r.err)
 		}
 		for _, finding := range r.findings {
+			if !cfg.json && !finding.MCPConfirmed {
+				continue
+			}
 			if writeErr != nil || ctx.Err() != nil {
 				continue
 			}

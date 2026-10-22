@@ -1,8 +1,11 @@
 package probe
 
 import (
+	"encoding/json"
 	"net/http"
 	"slices"
+
+	"github.com/st3fan/mcpeel/internal/auth"
 )
 
 const (
@@ -23,18 +26,20 @@ type TransportEvidence struct {
 // Finding represents confirmed transports at one final endpoint URL. The singular
 // fields describe the primary transport for compatibility, preferring Streamable HTTP.
 type Finding struct {
+	MCPConfirmed     bool                         `json:"mcp_confirmed"`
+	Authentication   []auth.Observation           `json:"authentication,omitempty"`
 	Input            string                       `json:"input"`
 	URL              string                       `json:"url"`
 	Transports       []string                     `json:"transports"`
 	TransportDetails map[string]TransportEvidence `json:"transport_details"`
-	Transport        string                       `json:"transport"`
-	Method           string                       `json:"method"`
-	ProtocolVersions []string                     `json:"protocol_versions"`
+	Transport        string                       `json:"transport,omitempty"`
+	Method           string                       `json:"method,omitempty"`
+	ProtocolVersions []string                     `json:"protocol_versions,omitempty"`
 	ServerInfo       *ServerInfo                  `json:"server_info,omitempty"`
 }
 
 func newFinding(endpoint, transport, method string, versions []string, info *ServerInfo) *Finding {
-	f := &Finding{URL: endpoint}
+	f := &Finding{URL: endpoint, MCPConfirmed: true}
 	f.Merge(Finding{TransportDetails: map[string]TransportEvidence{
 		transport: {Method: method, ProtocolVersions: versions, ServerInfo: info},
 	}})
@@ -43,6 +48,21 @@ func newFinding(endpoint, transport, method string, versions []string, info *Ser
 
 // Merge combines confirmed evidence for the same URL. Callers group by URL first.
 func (f *Finding) Merge(other Finding) {
+	f.MCPConfirmed = f.MCPConfirmed || other.MCPConfirmed
+	for _, observation := range other.Authentication {
+		key, _ := json.Marshal(observation)
+		duplicate := false
+		for _, existing := range f.Authentication {
+			raw, _ := json.Marshal(existing)
+			if string(raw) == string(key) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			f.Authentication = append(f.Authentication, observation.Clone())
+		}
+	}
 	if f.TransportDetails == nil {
 		f.TransportDetails = make(map[string]TransportEvidence)
 	}
@@ -70,7 +90,7 @@ func (f *Finding) Merge(other Finding) {
 		detail.PostResponseHeaders = copyHeaders(detail.PostResponseHeaders)
 		f.TransportDetails[transport] = detail
 	}
-	f.Transports = nil
+	f.Transports = make([]string, 0, 2)
 	for _, transport := range []string{StreamableHTTP, HTTPSSE} {
 		if _, ok := f.TransportDetails[transport]; ok {
 			f.Transports = append(f.Transports, transport)
