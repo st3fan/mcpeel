@@ -25,7 +25,7 @@ Input can contain DNS names, IPv4 addresses, bracketed IPv6 addresses, ports, or
 | `-c` | Maximum concurrent candidate exchanges; default `10` |
 | `-timeout` | Deadline per target endpoint; default `2.5s` (e.g. `750ms` or `10s` to override) |
 | `-no-subdomain` | Disable `mcp.` hostname expansion |
-| `-j`, `-json` | Emit confirmed endpoint transports and evidence as JSON Lines |
+| `-j`, `-json` | Emit endpoint, transport, and authentication evidence as JSON Lines |
 | `-v` | Show unconfirmed candidate diagnostics on stderr |
 | `-h` | Show help |
 
@@ -57,7 +57,31 @@ When aliases are combined, headers follow the selected confirmation evidence. Re
 
 The existing singular `transport`, `method`, `protocol_versions`, and `server_info` fields remain for compatibility. They describe the primary confirmed transport, preferring Streamable HTTP when both are found. Protocol versions from repeated observations of the same transport are combined, with discovery evidence preferred over initialization evidence. Different final URLs remain separate findings even when one input redirects its POST and GET requests differently. Server identity is self-reported. Output order depends on response times. Diagnostics always go to stderr.
 
-HTML mentioning MCP, arbitrary JSON-RPC/SSE, and bare HTTP status codes do not confirm a server. Authentication-blocked endpoints can remain undiscovered; this version does not log in, crawl websites, scan ports, call tools, or fetch resources/prompts. Zero findings does not prove that no MCP server exists.
+JSONL also reports authentication evidence in an `authentication` array. Each observation identifies the exact response URL, attempted transport, request method and stage, HTTP status, response headers, raw and parsed `WWW-Authenticate` challenges, advertised schemes, and any metadata-discovery outcome. Legacy SSE GET and initialization POST observations remain distinct. Duplicate aliases merge their observations without discarding an auth challenge when another probe succeeds.
+
+| Authentication state | Meaning |
+| --- | --- |
+| `anonymous_probe` | A valid MCP exchange succeeded without credentials for this tested operation |
+| `required` | HTTP 401, or HTTP 403 with an explicit usable authentication/scope challenge |
+| `unknown` | The response does not establish an access policy, such as bare 403, a blocked redirect, or a failed check |
+
+Every JSONL record includes `mcp_confirmed`. Auth-blocked candidates and blocked redirects can appear with `mcp_confirmed: false`, empty `transports`, and no fabricated server identity or protocol version. Plain output continues to contain only protocol-confirmed MCP URLs. Unreachable hosts and ordinary responses without MCP/authentication evidence remain diagnostics rather than auth findings.
+
+These abbreviated JSONL examples show the access states (full records also include URLs, headers, and other evidence):
+
+```json
+{"mcp_confirmed":true,"authentication":[{"state":"anonymous_probe","stage":"server/discover"}]}
+{"mcp_confirmed":false,"authentication":[{"state":"required","http_status":401,"schemes":["Bearer"]}]}
+{"mcp_confirmed":false,"authentication":[{"state":"unknown","http_status":403}]}
+```
+
+Supported HTTP challenge parsing includes Basic, Digest, Bearer, Negotiate, and other advertised scheme names, including repeated headers and multiple challenges with quoted parameters. A Bearer challenge alone does not establish OAuth, token format (JWT/opaque), or provider identity. API-key, cookie, and client-certificate requirements can remain unknown. A successful discovery probe does not prove that tools, resources, or other operations are public; mcpeel does not invoke them to test access.
+
+When advertised or appropriate for a 401/Bearer response, mcpeel can fetch OAuth protected-resource metadata from a challenge's `resource_metadata` URL or the endpoint-specific/root `/.well-known/oauth-protected-resource` locations. It records document URLs and outcomes (`validated`, `invalid`, `unavailable`, `external`, or `not_attempted`). A validated document must name the exact protected request URL in its `resource` field. Advertised authorization-server URLs, supported scopes, and token-presentation methods are retained; required scopes from a challenge remain separate from metadata's supported scopes. `oauth_advertised: true` means that resource-bound metadata advertised OAuth support, and does not confirm MCP support or require authentication for every operation.
+
+Metadata discovery shares the endpoint timeout and permits at most three distinct fetches per endpoint probe, each with the existing redirect limit and a 1 MiB body limit. Concurrent observations share fetches. Only same-origin metadata is fetched, including through redirects. External metadata and authorization-server URLs remain references. No login, client registration, token exchange, or credential guessing is performed.
+
+HTML mentioning MCP, arbitrary JSON-RPC/SSE, HTTP authentication challenges, and OAuth metadata do not by themselves confirm an MCP server. Authentication-blocked endpoints can remain unconfirmed. This version does not log in, crawl websites, scan ports, call tools, or fetch resources/prompts. Zero findings does not prove that no MCP server exists.
 
 Exit status is `0` for a completed scan (including zero findings), `1` for missing/invalid-only input, input-source errors or output errors, `2` for invalid command usage, and `130` for cancellation. Unreachable hosts do not abort the scan.
 

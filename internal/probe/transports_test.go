@@ -313,7 +313,7 @@ func TestLegacyPostRedirectStaysOnOrigin(t *testing.T) {
 	p := New(time.Second)
 	defer p.Close()
 	findings, err := p.Probe(context.Background(), targets.Candidate{URL: s.URL + "/mcp"})
-	if err == nil || len(findings) != 0 || outsideCalls.Load() != 0 {
+	if err == nil || len(findings) > 1 || len(findings) == 1 && findings[0].MCPConfirmed || outsideCalls.Load() != 0 {
 		t.Fatalf("legacy POST left its origin: %+v, %v, calls=%d", findings, err, outsideCalls.Load())
 	}
 }

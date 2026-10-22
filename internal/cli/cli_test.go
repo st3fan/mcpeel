@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/st3fan/mcpeel/internal/auth"
 	"github.com/st3fan/mcpeel/internal/probe"
 	"github.com/st3fan/mcpeel/internal/targets"
 )
@@ -204,7 +205,7 @@ func TestWorkerBoundAndFindingDedup(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		count.Add(1)
-		return []probe.Finding{{URL: "https://found.invalid/mcp"}}, nil
+		return []probe.Finding{{URL: "https://found.invalid/mcp", MCPConfirmed: true}}, nil
 	})
 	var out bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -239,7 +240,7 @@ func TestScanCancellationAndOutputFailure(t *testing.T) {
 		t.Fatal("workers failed to stop on cancellation")
 	}
 	p = checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
-		return []probe.Finding{{URL: c.URL}}, nil
+		return []probe.Finding{{URL: c.URL, MCPConfirmed: true}}, nil
 	})
 	if err := scan(context.Background(), config{concurrency: 2}, testCandidates(100), p, brokenWriter{}, io.Discard); err == nil || !strings.Contains(err.Error(), "write failed") {
 		t.Fatalf("output failure: %v", err)
@@ -319,7 +320,7 @@ func TestScanCombinesTransportEvidence(t *testing.T) {
 			detail.PostResponseHeaders = http.Header{"X-Fixture": {"sse-post"}}
 		}
 		return []probe.Finding{{
-			Input: c.URL, URL: endpoint, Transports: []string{transport},
+			Input: c.URL, URL: endpoint, Transports: []string{transport}, MCPConfirmed: true,
 			TransportDetails: map[string]probe.TransportEvidence{transport: detail},
 			Transport:        transport, Method: method, ProtocolVersions: versions, ServerInfo: info,
 		}}, nil
@@ -356,6 +357,92 @@ func TestScanCombinesTransportEvidence(t *testing.T) {
 						t.Fatalf("deduplication mixed response headers: %+v", f)
 					}
 				})
+			}
+		}
+	}
+}
+
+func TestAuthenticationOutput(t *testing.T) {
+	for _, public := range []bool{false, true} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/mcp" {
+				w.WriteHeader(404)
+				return
+			}
+			if public && r.Method == "POST" {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"jsonrpc":"2.0","id":"server/discover","result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{}}}`)
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Basic realm="private"`)
+			w.WriteHeader(401)
+		}))
+		for _, flag := range []string{"", "-j", "-json"} {
+			var out, errOut bytes.Buffer
+			args := []string{"-u", s.URL + "/mcp"}
+			if flag != "" {
+				args = append(args, flag)
+			}
+			code := Run(context.Background(), args, strings.NewReader(""), &out, &errOut)
+			if code != 0 || errOut.Len() != 0 {
+				t.Fatalf("scan failed: %d %s", code, &errOut)
+			}
+			if flag == "" {
+				want := ""
+				if public {
+					want = s.URL + "/mcp\n"
+				}
+				if out.String() != want {
+					t.Fatalf("plain output included unconfirmed endpoint: %q", &out)
+				}
+				continue
+			}
+			var f probe.Finding
+			if err := json.Unmarshal(out.Bytes(), &f); err != nil || f.MCPConfirmed != public || len(f.Authentication) != 2 || !public && len(f.Transports) != 0 {
+				t.Fatalf("JSONL confirmation/auth mismatch: %s, %v", &out, err)
+			}
+			anonymous, required := false, false
+			for _, o := range f.Authentication {
+				anonymous = anonymous || o.State == auth.AnonymousProbe
+				required = required || o.State == auth.Required && len(o.Schemes) == 1 && o.Schemes[0] == "Basic"
+			}
+			if anonymous != public || !required {
+				t.Fatalf("lost mixed access observations: %+v", f)
+			}
+		}
+		s.Close()
+	}
+}
+
+func TestMergeAuthenticationWithConfirmedAliases(t *testing.T) {
+	cs := testCandidates(3)
+	const endpoint = "https://found.invalid/mcp"
+	p := checkFunc(func(ctx context.Context, c targets.Candidate) ([]probe.Finding, error) {
+		o := auth.Observation{URL: endpoint, Transport: probe.HTTPSSE, Stage: "sse", Method: "GET", State: auth.Required, HTTPStatus: 401, Schemes: []string{"Basic"}}
+		f := probe.Finding{URL: endpoint, Transports: []string{}, TransportDetails: map[string]probe.TransportEvidence{}, Authentication: []auth.Observation{o}}
+		if c.URL == cs[1].URL {
+			f.MCPConfirmed = true
+			f.Transports = []string{probe.StreamableHTTP}
+			f.TransportDetails[probe.StreamableHTTP] = probe.TransportEvidence{Method: "server/discover", ProtocolVersions: []string{"2026-07-28"}}
+			f.Authentication = []auth.Observation{{URL: endpoint, Transport: probe.StreamableHTTP, Stage: "server/discover", Method: "POST", State: auth.AnonymousProbe, HTTPStatus: 200}}
+		}
+		return []probe.Finding{f}, nil
+	})
+	for _, order := range [][]targets.Candidate{cs, {cs[1], cs[0], cs[2]}} {
+		for _, structured := range []bool{false, true} {
+			var out bytes.Buffer
+			if err := scan(context.Background(), config{concurrency: 1, json: structured}, order, p, &out, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if !structured {
+				if out.String() != endpoint+"\n" {
+					t.Fatalf("alias hid confirmed URL: %q", &out)
+				}
+				continue
+			}
+			var f probe.Finding
+			if err := json.Unmarshal(out.Bytes(), &f); err != nil || !f.MCPConfirmed || len(f.Transports) != 1 || len(f.Authentication) != 2 {
+				t.Fatalf("lost/doubled merged auth evidence: %s, %v", &out, err)
 			}
 		}
 	}
