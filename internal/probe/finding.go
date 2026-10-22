@@ -23,8 +23,9 @@ type TransportEvidence struct {
 	PostResponseHeaders http.Header `json:"post_response_headers,omitempty"`
 }
 
-// Finding represents confirmed transports at one final endpoint URL. The singular
-// fields describe the primary transport for compatibility, preferring Streamable HTTP.
+// Finding represents confirmed MCP or authentication evidence at one endpoint URL.
+// The singular fields describe the primary confirmed transport for compatibility,
+// preferring Streamable HTTP.
 type Finding struct {
 	MCPConfirmed     bool                         `json:"mcp_confirmed"`
 	Authentication   []auth.Observation           `json:"authentication,omitempty"`
@@ -46,7 +47,8 @@ func newFinding(endpoint, transport, method string, versions []string, info *Ser
 	return f
 }
 
-// Merge combines confirmed evidence for the same URL. Callers group by URL first.
+// Merge combines protocol and authentication evidence for the same URL.
+// Callers group by URL first.
 func (f *Finding) Merge(other Finding) {
 	f.MCPConfirmed = f.MCPConfirmed || other.MCPConfirmed
 	for _, observation := range other.Authentication {
