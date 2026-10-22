@@ -101,15 +101,17 @@ func TestModernDiscovery(t *testing.T) {
 
 func TestInitializeAndCleanup(t *testing.T) {
 	for _, tt := range []struct {
-		version string
-		stream  bool
+		version         string
+		stream          bool
+		discoveryStatus int
 	}{
-		{"2025-11-25", false}, {"2025-11-25", true},
-		{"2025-06-18", false}, {"2025-06-18", true},
-		{"2025-03-26", false}, {"2025-03-26", true},
-		{"2024-11-05", false}, {"2024-11-05", true},
+		{"2025-11-25", false, 400}, {"2025-11-25", true, 400},
+		{"2025-06-18", false, 400}, {"2025-06-18", true, 400},
+		{"2025-03-26", false, 400}, {"2025-03-26", true, 400},
+		{"2024-11-05", false, 400}, {"2024-11-05", true, 400},
+		{"2025-03-26", false, 500}, {"2025-03-26", true, 503},
 	} {
-		t.Run(fmt.Sprintf("%s/stream=%v", tt.version, tt.stream), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/stream=%v/discovery=%d", tt.version, tt.stream, tt.discoveryStatus), func(t *testing.T) {
 			version := tt.version
 			var notified, deleted atomic.Bool
 			var attempts atomic.Int32
@@ -126,7 +128,7 @@ func TestInitializeAndCleanup(t *testing.T) {
 				req := request(t, r)
 				switch req.Method {
 				case "server/discover":
-					w.WriteHeader(400)
+					w.WriteHeader(tt.discoveryStatus)
 				case "initialize":
 					attempts.Add(1)
 					if req.Params.Version != version {

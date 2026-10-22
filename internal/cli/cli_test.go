@@ -414,6 +414,85 @@ func TestAuthenticationOutput(t *testing.T) {
 	}
 }
 
+func TestDiscovery5xxOutput(t *testing.T) {
+	for _, requireAuth := range []bool{false, true} {
+		t.Run(fmt.Sprintf("auth=%v", requireAuth), func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/mcp" {
+					w.WriteHeader(404)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					w.WriteHeader(400)
+					fmt.Fprint(w, `{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Session ID required"}}`)
+					return
+				}
+				var req struct{ Method string }
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				switch req.Method {
+				case "server/discover":
+					w.WriteHeader(500)
+				case "initialize":
+					if requireAuth {
+						w.Header().Set("WWW-Authenticate", `Basic realm="initialize"`)
+						w.WriteHeader(401)
+						return
+					}
+					fmt.Fprint(w, `{"jsonrpc":"2.0","id":"initialize","result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}`)
+				case "notifications/initialized":
+					w.WriteHeader(202)
+				default:
+					t.Errorf("unexpected request: %s", req.Method)
+				}
+			}))
+			defer s.Close()
+			for _, flag := range []string{"", "-j", "-json"} {
+				var out, errOut bytes.Buffer
+				args := []string{"-u", s.URL + "/mcp", "-no-subdomain"}
+				if flag != "" {
+					args = append(args, flag)
+				}
+				if code := Run(context.Background(), args, strings.NewReader(""), &out, &errOut); code != 0 || errOut.Len() != 0 {
+					t.Fatalf("scan failed: %d %s", code, &errOut)
+				}
+				if flag == "" {
+					want := ""
+					if !requireAuth {
+						want = s.URL + "/mcp\n"
+					}
+					if out.String() != want {
+						t.Fatalf("plain output=%q want=%q", &out, want)
+					}
+					continue
+				}
+				var f probe.Finding
+				if err := json.Unmarshal(out.Bytes(), &f); err != nil || f.MCPConfirmed != !requireAuth || len(f.Authentication) != 3 {
+					t.Fatalf("JSONL lost fallback evidence: %s, %v", &out, err)
+				}
+				if requireAuth {
+					if len(f.Transports) != 0 || f.ServerInfo != nil {
+						t.Fatalf("auth became confirmation: %+v", f)
+					}
+				} else if f.Method != "initialize" || f.ServerInfo == nil || f.ServerInfo.Name != "fixture" || !reflect.DeepEqual(f.Transports, []string{probe.StreamableHTTP}) {
+					t.Fatalf("incorrect initialization evidence: %+v", f)
+				}
+				found := false
+				for _, o := range f.Authentication {
+					if o.Stage == "initialize" {
+						found = o.State == auth.AnonymousProbe && !requireAuth || o.State == auth.Required && requireAuth && reflect.DeepEqual(o.Schemes, []string{"Basic"})
+					}
+				}
+				if !found {
+					t.Fatalf("lost initialization access state: %+v", f.Authentication)
+				}
+			}
+		})
+	}
+}
+
 func TestMergeAuthenticationWithConfirmedAliases(t *testing.T) {
 	cs := testCandidates(3)
 	const endpoint = "https://found.invalid/mcp"
